@@ -8,7 +8,7 @@ import uuid
 from typing import Dict, List, Any, Optional
 
 from core.exchange import Exchange
-from core.grid_strategy import GridStrategy
+from core.grid_strategy import GridStrategy, MarketIntelligenceEngine, AdaptiveParameterManager
 from core.data_store import DataStore
 
 class GridManager:
@@ -87,7 +87,8 @@ class GridManager:
                    take_profit_pnl: float,
                    stop_loss_pnl: float,
                    leverage: float = 20.0,
-                   enable_grid_adaptation: bool = True) -> str:
+                   enable_grid_adaptation: bool = True,
+                    enable_samig: bool = True) -> str:
         """
         Create a new grid strategy.
         
@@ -121,7 +122,8 @@ class GridManager:
                 stop_loss_pnl=float(stop_loss_pnl),
                 grid_id=grid_id,
                 leverage=float(leverage),
-                enable_grid_adaptation=enable_grid_adaptation
+                enable_grid_adaptation=enable_grid_adaptation,
+                 enable_samig=enable_samig  # Add this
             )
             
             # Add to grids dictionary
@@ -323,7 +325,8 @@ class GridManager:
                       grid_id: str, 
                       take_profit_pnl: Optional[float] = None,
                       stop_loss_pnl: Optional[float] = None,
-                      enable_grid_adaptation: Optional[bool] = None) -> bool:
+                      enable_grid_adaptation: Optional[bool] = None,
+                      enable_samig: Optional[bool] = None) -> bool:
         """
         Update grid configuration parameters.
         
@@ -339,6 +342,19 @@ class GridManager:
             bool: Success status
         """
         try:
+            
+            # Add SAMIG parameter update:
+            if enable_samig is not None:
+                grid.enable_samig = bool(enable_samig)
+                if enable_samig and not hasattr(grid, 'market_intelligence'):
+                    # Initialize SAMIG components if enabling
+                    from collections import deque
+                    grid.market_intelligence = MarketIntelligenceEngine(grid.original_symbol)
+                    grid.parameter_manager = AdaptiveParameterManager()
+                    grid.performance_tracker = deque(maxlen=50)
+                    grid.current_market_snapshot = None
+                    grid.adaptation_count = 0
+    
             if grid_id not in self.grids:
                 self.logger.error(f"Grid {grid_id} not found")
                 return False

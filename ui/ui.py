@@ -262,7 +262,10 @@ class GridBotUI:
         auto_start_var.set(False)
         ttk.Checkbutton(dialog, text="Start Grid Automatically", variable=auto_start_var).grid(
             row=8, column=0, columnspan=2, padx=5, pady=5, sticky=tk.W)
-        
+        samig_var = tk.BooleanVar()
+        samig_var.set(True)
+        ttk.Checkbutton(dialog, text="Enable SAMIG (Self-Adaptive Market Intelligence)", 
+                    variable=samig_var).grid(row=9, column=0, columnspan=2, padx=5, pady=5, sticky=tk.W)
         # Buttons
         def on_create():
             try:
@@ -275,6 +278,7 @@ class GridBotUI:
                 stop_loss = stop_loss_var.get()
                 leverage = leverage_var.get()
                 auto_start = auto_start_var.get()
+                enable_samig = samig_var.get()
                 
                 # Validate inputs
                 if not symbol:
@@ -306,7 +310,8 @@ class GridBotUI:
                     investment=investment,
                     take_profit_pnl=take_profit,
                     stop_loss_pnl=stop_loss,
-                    leverage=leverage
+                    leverage=leverage,
+                    enable_samig=enable_samig
                 )
                 
                 # Start grid if requested
@@ -427,17 +432,24 @@ class GridBotUI:
         stop_loss_var.set(grid_status['stop_loss_pnl'])
         ttk.Entry(dialog, textvariable=stop_loss_var).grid(row=1, column=1, padx=5, pady=5, sticky=tk.W+tk.E)
         
+        # SAMIG Enable
+        ttk.Label(dialog, text="Enable SAMIG:").grid(row=2, column=0, padx=5, pady=5, sticky=tk.W)
+        samig_var = tk.BooleanVar()
+        samig_var.set(grid_status.get('enable_samig', False))
+        ttk.Checkbutton(dialog, variable=samig_var).grid(row=2, column=1, padx=5, pady=5, sticky=tk.W)
+    
         # Buttons
         def on_update():
             try:
                 take_profit = take_profit_var.get()
                 stop_loss = stop_loss_var.get()
-                
+                enable_samig = samig_var.get() 
                 # Update grid config
                 if self.grid_manager.update_grid_config(
                     grid_id=grid_id,
                     take_profit_pnl=take_profit,
-                    stop_loss_pnl=stop_loss
+                    stop_loss_pnl=stop_loss,
+                    enable_samig=enable_samig
                 ):
                     messagebox.showinfo("Success", f"Grid {grid_id} configuration updated")
                     self.update_grids_list()

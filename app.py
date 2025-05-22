@@ -114,6 +114,7 @@ def create_grid():
             
             # Get boolean fields
             enable_grid_adaptation = 'enable_grid_adaptation' in request.form
+            enable_samig = 'enable_samig' in request.form
             
             # Validate inputs
             if price_lower >= price_upper:
@@ -156,7 +157,8 @@ def create_grid():
                 take_profit_pnl=take_profit_pnl,
                 stop_loss_pnl=stop_loss_pnl,
                 leverage=leverage,
-                enable_grid_adaptation=enable_grid_adaptation
+                enable_grid_adaptation=enable_grid_adaptation,
+                enable_samig=enable_samig  
             )
             
             if not grid_id:
@@ -231,14 +233,15 @@ def edit_grid(grid_id):
             take_profit_pnl = float(request.form['take_profit_pnl'])
             stop_loss_pnl = float(request.form['stop_loss_pnl'])
             enable_grid_adaptation = 'enable_grid_adaptation' in request.form
-            
+            enable_samig = 'enable_samig' in request.form
             logger.info(f"Updating grid {grid_id}: TP={take_profit_pnl}%, SL={stop_loss_pnl}%, Adaptation={enable_grid_adaptation}")
             
             if grid_manager.update_grid_config(
                 grid_id=grid_id,
                 take_profit_pnl=take_profit_pnl,
                 stop_loss_pnl=stop_loss_pnl,
-                enable_grid_adaptation=enable_grid_adaptation
+                enable_grid_adaptation=enable_grid_adaptation,
+                enable_samig=enable_samig
             ):
                 return redirect(url_for('index'))
             return render_template('error.html', error=f"Failed to update grid {grid_id}")
