@@ -1,5 +1,5 @@
 """
-Grid trading strategy implementation with proper position management.
+Grid trading strategy implementation with proper directional exposure management.
 """
 import logging
 import time
@@ -21,7 +21,7 @@ class GridStrategy:
                  leverage: float = 20.0,
                  enable_grid_adaptation: bool = True):
         """
-        Initialize the grid strategy with position management.
+        Initialize the grid strategy with proper directional exposure management.
         """
         self.logger = logging.getLogger(__name__)
         self.exchange = exchange
@@ -45,15 +45,11 @@ class GridStrategy:
         self.grid_interval = (self.price_upper - self.price_lower) / self.grid_number
         self.original_grid_interval = self.grid_interval
         
-        # Position management
-        self.max_positions = max(1, self.grid_number // 2)  # Max positions in one direction
-        self.position_history = []       # Track filled orders for PnL calculation
-        self.buy_orders_filled = []      # Track filled buy orders
-        self.sell_orders_filled = []     # Track filled sell orders
+        # Investment per grid level (used for order sizing)
+        self.investment_per_grid = self.investment / self.grid_number
         
-        # Store grid orders and positions
+        # Store grid orders
         self.grid_orders = {}
-        self.positions = {}
         
         # Performance metrics
         self.pnl = 0.0
@@ -170,25 +166,24 @@ class GridStrategy:
             return []
     
     def _calculate_order_amount(self) -> float:
-        """Calculate order amount for each grid level."""
+        """Calculate order amount for each grid level based on investment per grid."""
         try:
-            investment = float(self.investment)
-            grid_number = int(self.grid_number)
-            leverage = float(self.leverage) if hasattr(self, 'leverage') else 20.0
+            leverage = float(self.leverage)
             
-            investment_per_grid = investment / grid_number
-            self.logger.info(f"Investment per grid: {investment_per_grid}")
-            
+            # Get current price
             ticker = self.exchange.get_ticker(self.symbol)
             price = float(ticker['last'])
             self.logger.info(f"Current price for {self.symbol}: {price}")
             
-            amount = (investment_per_grid * leverage) / price
-            self.logger.info(f"Base order amount (with {leverage}x leverage): {amount}")
+            # Calculate amount based on investment per grid level
+            amount = (self.investment_per_grid * leverage) / price
+            self.logger.info(f"Order amount per grid (investment: {self.investment_per_grid}, leverage: {leverage}x): {amount}")
             
+            # Ensure amount meets minimum requirements
             min_amount = self.min_amount if hasattr(self, 'min_amount') and self.min_amount > 0 else 0.00001
             amount = max(amount, min_amount)
             
+            # Round amount according to market precision
             rounded_amount = self._round_amount(amount)
             self.logger.info(f"Final rounded order amount: {rounded_amount}")
             
@@ -197,6 +192,90 @@ class GridStrategy:
             self.logger.error(f"Error calculating order amount: {e}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
             return self.min_amount if hasattr(self, 'min_amount') and self.min_amount > 0 else 0.00001
+    
+    def _get_directional_exposure(self) -> Dict[str, float]:
+        """Get current directional exposure breakdown."""
+        try:
+            # Get current net position value
+            positions = self.exchange.get_positions(self.symbol)
+            net_position_value = 0.0
+            
+            for position in positions:
+                initial_margin = float(position.get('initialMargin', 0))
+                side = position.get('side', '')
+                
+                if side == 'long':
+                    net_position_value += initial_margin
+                elif side == 'short':
+                    net_position_value -= initial_margin
+            
+            # Get potential exposure from open orders
+            open_orders = self.exchange.get_open_orders(self.symbol)
+            potential_long_exposure = 0.0
+            potential_short_exposure = 0.0
+            
+            for order in open_orders:
+                if order['id'] in self.grid_orders:
+                    if order['side'] == 'buy':
+                        potential_long_exposure += self.investment_per_grid
+                    elif order['side'] == 'sell':
+                        potential_short_exposure += self.investment_per_grid
+            
+            # Calculate total potential exposure
+            total_potential_long = max(0, net_position_value) + potential_long_exposure
+            total_potential_short = abs(min(0, net_position_value)) + potential_short_exposure
+            
+            exposure = {
+                'net_position_value': net_position_value,
+                'current_long_value': max(0, net_position_value),
+                'current_short_value': abs(min(0, net_position_value)),
+                'potential_long_exposure': potential_long_exposure,
+                'potential_short_exposure': potential_short_exposure,
+                'total_potential_long': total_potential_long,
+                'total_potential_short': total_potential_short,
+                'remaining_long_budget': max(0, self.investment - total_potential_long),
+                'remaining_short_budget': max(0, self.investment - total_potential_short)
+            }
+            
+            self.logger.debug(f"Directional exposure: Long=${exposure['current_long_value']:.2f}+${exposure['potential_long_exposure']:.2f}=${exposure['total_potential_long']:.2f}, Short=${exposure['current_short_value']:.2f}+${exposure['potential_short_exposure']:.2f}=${exposure['total_potential_short']:.2f}")
+            
+            return exposure
+        except Exception as e:
+            self.logger.error(f"Error getting directional exposure: {e}")
+            return {
+                'net_position_value': 0, 'current_long_value': 0, 'current_short_value': 0,
+                'potential_long_exposure': 0, 'potential_short_exposure': 0,
+                'total_potential_long': 0, 'total_potential_short': 0,
+                'remaining_long_budget': self.investment, 'remaining_short_budget': self.investment
+            }
+    
+    def _can_place_buy_order(self) -> bool:
+        """Check if we can place a buy order without exceeding long exposure limit."""
+        try:
+            exposure = self._get_directional_exposure()
+            can_place = exposure['remaining_long_budget'] >= self.investment_per_grid
+            
+            if not can_place:
+                self.logger.debug(f"Cannot place buy order: remaining long budget ${exposure['remaining_long_budget']:.2f} < required ${self.investment_per_grid:.2f}")
+            
+            return can_place
+        except Exception as e:
+            self.logger.error(f"Error checking if can place buy order: {e}")
+            return False
+    
+    def _can_place_sell_order(self) -> bool:
+        """Check if we can place a sell order without exceeding short exposure limit."""
+        try:
+            exposure = self._get_directional_exposure()
+            can_place = exposure['remaining_short_budget'] >= self.investment_per_grid
+            
+            if not can_place:
+                self.logger.debug(f"Cannot place sell order: remaining short budget ${exposure['remaining_short_budget']:.2f} < required ${self.investment_per_grid:.2f}")
+            
+            return can_place
+        except Exception as e:
+            self.logger.error(f"Error checking if can place sell order: {e}")
+            return False
     
     def _cancel_existing_orders(self):
         """Cancel any existing orders for this symbol."""
@@ -216,34 +295,9 @@ class GridStrategy:
                     
         except Exception as e:
             self.logger.error(f"Error cancelling existing orders: {str(e)}")
-    
-    def _get_current_position_counts(self) -> tuple:
-        """Get current position counts by counting actual open orders."""
-        try:
-            open_orders = self.exchange.get_open_orders(self.symbol)
-            buy_count = len([order for order in open_orders if order['side'] == 'buy'])
-            sell_count = len([order for order in open_orders if order['side'] == 'sell'])
-            return buy_count, sell_count
-        except Exception as e:
-            self.logger.error(f"Error getting current position counts: {e}")
-            return 0, 0
-    
-    def _can_place_buy_order(self) -> bool:
-        """Check if we can place a buy order without exceeding position limits."""
-        buy_count, _ = self._get_current_position_counts()
-        return buy_count < self.max_positions
-    
-    def _can_place_sell_order(self) -> bool:
-        """Check if we can place a sell order without exceeding position limits."""
-        _, sell_count = self._get_current_position_counts()
-        return sell_count < self.max_positions
-    
-    def _update_position_count(self, order_type: str, action: str):
-        """Legacy function - position counts now based on actual open orders."""
-        pass
 
     def setup_grid(self) -> None:
-        """Setup the initial grid orders with position management."""
+        """Setup the initial grid orders with proper directional exposure management."""
         try:
             self.price_lower = float(self.price_lower)
             self.price_upper = float(self.price_upper)
@@ -254,29 +308,29 @@ class GridStrategy:
             amount = self._calculate_order_amount()
             current_price = float(self.exchange.get_ticker(self.symbol)['last'])
             
-            # Get current position counts for logging
-            buy_count, sell_count = self._get_current_position_counts()
-            
             self.logger.info(f"Setting up grid for {self.symbol} with {self.grid_number} levels")
             self.logger.info(f"Price range: {self.price_lower} - {self.price_upper}")
             self.logger.info(f"Current price: {current_price}")
-            self.logger.info(f"Max positions per direction: {self.max_positions}")
-            self.logger.info(f"Current open orders: Buy={buy_count}, Sell={sell_count}")
+            self.logger.info(f"Investment per grid: {self.investment_per_grid}")
+            self.logger.info(f"Total investment budget: {self.investment}")
+            
+            # Check current directional exposure
+            exposure = self._get_directional_exposure()
+            self.logger.info(f"Current exposure: Long=${exposure['current_long_value']:.2f}, Short=${exposure['current_short_value']:.2f}")
+            self.logger.info(f"Remaining budgets: Long=${exposure['remaining_long_budget']:.2f}, Short=${exposure['remaining_short_budget']:.2f}")
             
             self._cancel_existing_orders()
             self.grid_orders = {}
             
-            grid_levels = self._calculate_grid_levels()
-            amount = self._calculate_order_amount()
-            
-            order_count = 0
+            orders_placed = 0
             retry_count = 3
             
+            # Place initial grid orders with directional limits
             for i in range(len(grid_levels) - 1):
                 buy_price = grid_levels[i]
                 sell_price = grid_levels[i + 1]
                 
-                # Place buy orders below current price (with position limit check)
+                # Place buy orders below current price (if long budget allows)
                 if buy_price < current_price and self._can_place_buy_order():
                     order_placed = False
                     retry = 0
@@ -301,7 +355,7 @@ class GridStrategy:
                                 }
                                 self.logger.info(f"Confirmed buy order at level {i}: {buy_price}, ID: {order['id']}")
                                 order_placed = True
-                                order_count += 1
+                                orders_placed += 1
                             else:
                                 self.logger.warning(f"Order status for buy order at {buy_price} is {order_status.get('status', 'unknown')}. Retrying...")
                                 retry += 1
@@ -313,12 +367,9 @@ class GridStrategy:
                     if not order_placed:
                         self.logger.error(f"Failed to place buy order at level {i} after {retry_count} attempts")
                 elif buy_price < current_price:
-                    buy_count, _ = self._get_current_position_counts()
-                    self.logger.info(f"Skipping buy order at price {buy_price} (position limit reached: {buy_count}/{self.max_positions})")
-                else:
-                    self.logger.info(f"Skipping buy order at price {buy_price} (above current price)")
-                    
-                # Place sell orders above current price (with position limit check)
+                    self.logger.info(f"Skipping buy order at {buy_price} - long exposure limit reached")
+                
+                # Place sell orders above current price (if short budget allows)
                 if sell_price > current_price and self._can_place_sell_order():
                     order_placed = False
                     retry = 0
@@ -343,7 +394,7 @@ class GridStrategy:
                                 }
                                 self.logger.info(f"Confirmed sell order at level {i+1}: {sell_price}, ID: {order['id']}")
                                 order_placed = True
-                                order_count += 1
+                                orders_placed += 1
                             else:
                                 self.logger.warning(f"Order status for sell order at {sell_price} is {order_status.get('status', 'unknown')}. Retrying...")
                                 retry += 1
@@ -355,14 +406,14 @@ class GridStrategy:
                     if not order_placed:
                         self.logger.error(f"Failed to place sell order at level {i+1} after {retry_count} attempts")
                 elif sell_price > current_price:
-                    _, sell_count = self._get_current_position_counts()
-                    self.logger.info(f"Skipping sell order at price {sell_price} (position limit reached: {sell_count}/{self.max_positions})")
-                else:
-                    self.logger.info(f"Skipping sell order at price {sell_price} (below current price)")
+                    self.logger.info(f"Skipping sell order at {sell_price} - short exposure limit reached")
+            
+            # Final exposure report
+            final_exposure = self._get_directional_exposure()
+            self.logger.info(f"Grid setup complete. Placed {orders_placed} orders.")
+            self.logger.info(f"Final exposure: Long=${final_exposure['total_potential_long']:.2f}, Short=${final_exposure['total_potential_short']:.2f}")
             
             open_orders = [o for o in self.grid_orders.values() if o['status'] == 'open']
-            self.logger.info(f"Grid setup complete. Successfully placed {len(open_orders)} orders.")
-            
             if len(open_orders) > 0:
                 self.running = True
                 self.logger.info(f"Grid is now running with {len(open_orders)} active orders.")
@@ -403,65 +454,84 @@ class GridStrategy:
         return False
     
     def _adapt_grid_to_price(self, current_price: float) -> None:
-        """Adapt the grid to follow the price movement."""
+        """Adapt the grid to follow the price movement while preserving directional exposure management."""
         try:
-            self.logger.info(f"Adapting grid to follow price movement. Current price: {current_price}")
+            self.logger.info(f"GRID ADAPTATION TRIGGERED: Price {current_price} moved outside boundaries")
+            
+            # Log current exposure before adaptation
+            pre_exposure = self._get_directional_exposure()
+            self.logger.info(f"Pre-adaptation exposure: Long=${pre_exposure['current_long_value']:.2f}, Short=${pre_exposure['current_short_value']:.2f}")
             
             old_lower = self.price_lower
             old_upper = self.price_upper
             
+            # Calculate new grid boundaries centered around current price
             grid_size = self.price_upper - self.price_lower
             grid_center = current_price
             
             new_lower = grid_center - (grid_size / 2)
             new_upper = grid_center + (grid_size / 2)
             
+            # Ensure positive prices
             if new_lower <= 0:
                 new_lower = 0.00001
                 new_upper = new_lower + grid_size
             
-            self.logger.info(f"New grid boundaries: [{new_lower} - {new_upper}] (old: [{old_lower} - {old_upper}])")
+            self.logger.info(f"GRID SHIFT: [{old_lower:.6f} - {old_upper:.6f}] → [{new_lower:.6f} - {new_upper:.6f}]")
             
+            # Update grid parameters
             self.price_lower = new_lower
             self.price_upper = new_upper
             self.grid_interval = (self.price_upper - self.price_lower) / self.grid_number
             
-            # Reset position tracking for new grid (no counters to reset)
-            pass
-            
-            self.logger.info("Cancelling all existing orders before adapting grid")
+            # Cancel all existing orders (this frees up order budget but keeps positions)
+            self.logger.info("Cancelling all existing orders before grid adaptation")
             try:
                 self.exchange.cancel_all_orders(self.symbol)
                 time.sleep(2)
+                self.logger.info("Orders cancelled - order budget freed for new grid")
             except Exception as cancel_error:
                 self.logger.error(f"Error cancelling orders during grid adaptation: {cancel_error}")
             
-            self.logger.info("Setting up new grid with adapted boundaries")
+            # Setup new grid with adapted boundaries
+            # This will respect directional exposure limits based on existing positions
+            self.logger.info("Setting up NEW GRID with adapted boundaries and directional limits")
             
             old_grid_orders = self.grid_orders.copy()
             self.grid_orders = {}
             
             try:
+                # Log exposure available for new grid
+                adaptation_exposure = self._get_directional_exposure()
+                self.logger.info(f"Available for new grid: Long budget=${adaptation_exposure['remaining_long_budget']:.2f}, Short budget=${adaptation_exposure['remaining_short_budget']:.2f}")
+                
+                # Setup new grid (this respects directional limits)
                 self.setup_grid()
+                
                 self.grid_adjustments_count += 1
-                self.logger.info(f"Successfully adapted grid to new boundaries. Adjustment #{self.grid_adjustments_count}")
+                
+                # Log successful adaptation
+                post_exposure = self._get_directional_exposure()
+                self.logger.info(f"GRID ADAPTATION #{self.grid_adjustments_count} COMPLETE")
+                self.logger.info(f"Post-adaptation exposure: Long=${post_exposure['total_potential_long']:.2f}, Short=${post_exposure['total_potential_short']:.2f}")
                 
             except Exception as setup_error:
                 self.logger.error(f"Failed to set up adapted grid: {setup_error}")
                 
+                # Rollback to old grid parameters
                 self.price_lower = old_lower
                 self.price_upper = old_upper
                 self.grid_interval = (self.price_upper - self.price_lower) / self.grid_number
                 self.grid_orders = old_grid_orders
                 
-                self.logger.warning("Restored previous grid parameters after adaptation failure")
+                self.logger.warning("ROLLBACK: Restored previous grid parameters after adaptation failure")
         
         except Exception as e:
-            self.logger.error(f"Error adapting grid: {e}")
+            self.logger.error(f"Error in grid adaptation: {e}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
     
     def _update_orders(self):
-        """Update order status and handle filled orders with position tracking."""
+        """Update order status and handle filled orders."""
         open_orders = self.exchange.get_open_orders(self.symbol)
         current_order_ids = {order['id']: order for order in open_orders}
         
@@ -489,30 +559,17 @@ class GridStrategy:
                         order_info['status'] = order_status['status']
                         self.trades_count += 1
                         
-                        # Update position count (legacy call - now does nothing)
-                        self._update_position_count(order_info['type'], "add")
-                        
-                        # Track filled orders for proper PnL calculation
                         fill_price = float(order_status.get('average', order_info['price']))
-                        fill_data = {
-                            'type': order_info['type'],
-                            'price': fill_price,
-                            'amount': order_info['amount'],
-                            'timestamp': time.time(),
-                            'grid_level': order_info['grid_level']
-                        }
+                        self.logger.info(f"Order filled: {order_id} ({order_info['type']} at {fill_price})")
                         
-                        if order_info['type'] == 'buy':
-                            self.buy_orders_filled.append(fill_data)
-                            self.logger.info(f"Buy order filled: {order_id} at {fill_price}")
-                        else:
-                            self.sell_orders_filled.append(fill_data)
-                            self.logger.info(f"Sell order filled: {order_id} at {fill_price}")
+                        # Log directional exposure after order fill
+                        exposure = self._get_directional_exposure()
+                        self.logger.info(f"After fill - Long: ${exposure['current_long_value']:.2f}, Short: ${exposure['current_short_value']:.2f}")
                         
-                        # Calculate PnL from completed round trips
+                        # Calculate PnL from position changes
                         self._calculate_pnl()
                         
-                        # Place counter order with position limit check
+                        # Place counter order with directional limits
                         self._place_counter_order_with_confirmation(order_info)
                     
                     elif order_status['status'] == 'canceled':
@@ -525,10 +582,11 @@ class GridStrategy:
                 except Exception as e:
                     self.logger.error(f"Error checking order {order_id} status: {e}")
         
+        # Ensure grid coverage with directional limits
         self._ensure_grid_coverage(active_buy_levels, active_sell_levels)
     
     def _place_counter_order_with_confirmation(self, filled_order: Dict) -> None:
-        """Place a counter order after an order is filled, with position limit check."""
+        """Place a counter order after an order is filled, respecting directional limits."""
         try:
             grid_level = filled_order['grid_level']
             price = filled_order['price']
@@ -536,7 +594,7 @@ class GridStrategy:
             retry_count = 3
             
             if filled_order['type'] == 'buy':
-                # Place sell order one level up (if we can)
+                # Buy order filled (long position created) -> place sell order above it
                 sell_price = self._round_price(price + self.grid_interval)
                 
                 if sell_price <= self.price_upper and self._can_place_sell_order():
@@ -573,15 +631,13 @@ class GridStrategy:
                     
                     if not order_placed:
                         self.logger.error(f"Failed to place counter sell order after {retry_count} attempts")
+                elif sell_price > self.price_upper:
+                    self.logger.info(f"Counter sell order at {sell_price} exceeds upper price limit")
                 else:
-                    if sell_price > self.price_upper:
-                        self.logger.info(f"Counter sell order at {sell_price} exceeds upper price limit")
-                    else:
-                        _, sell_count = self._get_current_position_counts()
-                        self.logger.info(f"Cannot place counter sell order - position limit reached ({sell_count}/{self.max_positions})")
+                    self.logger.info(f"Counter sell order skipped - short exposure limit reached")
             
             elif filled_order['type'] == 'sell':
-                # Place buy order one level down (if we can)
+                # Sell order filled (position closed/short created) -> place buy order below it
                 buy_price = self._round_price(price - self.grid_interval)
                 
                 if buy_price >= self.price_lower and self._can_place_buy_order():
@@ -618,49 +674,34 @@ class GridStrategy:
                     
                     if not order_placed:
                         self.logger.error(f"Failed to place counter buy order after {retry_count} attempts")
+                elif buy_price < self.price_lower:
+                    self.logger.info(f"Counter buy order at {buy_price} below lower price limit")
                 else:
-                    if buy_price < self.price_lower:
-                        self.logger.info(f"Counter buy order at {buy_price} below lower price limit")
-                    else:
-                        buy_count, _ = self._get_current_position_counts()
-                        self.logger.info(f"Cannot place counter buy order - position limit reached ({buy_count}/{self.max_positions})")
+                    self.logger.info(f"Counter buy order skipped - long exposure limit reached")
         
         except Exception as e:
             self.logger.error(f"Error in _place_counter_order_with_confirmation: {e}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
     
     def _calculate_pnl(self) -> None:
-        """Calculate PnL from completed round trips (buy-sell pairs)."""
+        """Calculate PnL from actual position changes."""
         try:
-            total_pnl = 0.0
+            positions = self.exchange.get_positions(self.symbol)
+            unrealized_pnl = 0.0
             
-            # Sort orders by timestamp to match buy-sell pairs
-            buy_orders = sorted(self.buy_orders_filled, key=lambda x: x['timestamp'])
-            sell_orders = sorted(self.sell_orders_filled, key=lambda x: x['timestamp'])
+            for position in positions:
+                unrealized_pnl += float(position.get('unrealizedPnl', 0))
             
-            # Match completed round trips
-            matched_pairs = min(len(buy_orders), len(sell_orders))
-            
-            for i in range(matched_pairs):
-                buy_order = buy_orders[i]
-                sell_order = sell_orders[i]
-                
-                # Calculate profit for this round trip
-                # Profit = (sell_price - buy_price) * amount
-                profit = (sell_order['price'] - buy_order['price']) * buy_order['amount']
-                total_pnl += profit
-                
-                self.logger.debug(f"Round trip {i+1}: Buy at {buy_order['price']}, Sell at {sell_order['price']}, Profit: {profit:.6f}")
-            
-            self.pnl = total_pnl
+            self.pnl = unrealized_pnl
             pnl_percentage = (self.pnl / self.initial_investment) * 100 if self.initial_investment > 0 else 0
             
-            self.logger.debug(f"Total PnL: {self.pnl:.6f} ({pnl_percentage:.4f}%)")
+            self.logger.debug(f"Current PnL: {self.pnl:.6f} ({pnl_percentage:.4f}%)")
             
         except Exception as e:
             self.logger.error(f"Error calculating PnL: {e}")
     
-        """Ensure all grid levels have active orders if needed, with position limits."""
+    def _ensure_grid_coverage(self, active_buy_levels: Set[int], active_sell_levels: Set[int]) -> None:
+        """Ensure grid coverage by replacing missing orders, respecting directional limits."""
         try:
             current_price = float(self.exchange.get_ticker(self.symbol)['last'])
             grid_levels = self._calculate_grid_levels()
@@ -670,19 +711,16 @@ class GridStrategy:
                 return
                 
             self.logger.debug(f"Checking grid coverage. Current price: {current_price}")
-            self.logger.debug(f"Active buy levels: {self.active_buy_levels}")
-            self.logger.debug(f"Active sell levels: {self.active_sell_levels}")
-            
-            buy_count, sell_count = self._get_current_position_counts()
-            self.logger.debug(f"Position limits: Buy={buy_count}/{self.max_positions}, Sell={sell_count}/{self.max_positions}")
+            self.logger.debug(f"Active buy levels: {active_buy_levels}")
+            self.logger.debug(f"Active sell levels: {active_sell_levels}")
             
             for i in range(len(grid_levels) - 1):
                 buy_price = grid_levels[i]
                 sell_price = grid_levels[i + 1]
                 
-                # Check for missing buy orders below current price (with position limit)
+                # Check for missing buy orders below current price (if long budget allows)
                 if (buy_price < current_price and 
-                    i not in self.active_buy_levels and 
+                    i not in active_buy_levels and 
                     self._can_place_buy_order()):
                     
                     self.logger.info(f"Missing buy order at level {i} (price: {buy_price}). Placing order...")
@@ -699,9 +737,9 @@ class GridStrategy:
                     except Exception as e:
                         self.logger.error(f"Failed to place missing buy order at level {i}: {e}")
                 
-                # Check for missing sell orders above current price (with position limit)
+                # Check for missing sell orders above current price (if short budget allows)
                 if (sell_price > current_price and 
-                    (i + 1) not in self.active_sell_levels and 
+                    (i + 1) not in active_sell_levels and 
                     self._can_place_sell_order()):
                     
                     self.logger.info(f"Missing sell order at level {i+1} (price: {sell_price}). Placing order...")
@@ -776,9 +814,6 @@ class GridStrategy:
             except Exception as e:
                 self.logger.error(f"Error getting positions for {self.symbol}: {e}")
 
-            # Reset position counters (no longer used)
-            pass
-            
             self.running = False
             self.logger.info(f"Grid strategy stopped for {self.symbol}")
             
@@ -788,9 +823,10 @@ class GridStrategy:
             self.running = False
         
     def get_status(self) -> Dict:
-        """Get the current status of the grid strategy with position info."""
+        """Get the current status of the grid strategy."""
         try:
-            buy_count, sell_count = self._get_current_position_counts()
+            exposure = self._get_directional_exposure()
+            
             status = {
                 'grid_id': self.grid_id,
                 'symbol': self.symbol,
@@ -800,14 +836,20 @@ class GridStrategy:
                 'grid_number': self.grid_number,
                 'grid_interval': self.grid_interval,
                 'investment': self.investment,
+                'investment_per_grid': self.investment_per_grid,
+                'current_long_value': exposure['current_long_value'],
+                'current_short_value': exposure['current_short_value'],
+                'potential_long_exposure': exposure['potential_long_exposure'],
+                'potential_short_exposure': exposure['potential_short_exposure'],
+                'total_potential_long': exposure['total_potential_long'],
+                'total_potential_short': exposure['total_potential_short'],
+                'remaining_long_budget': exposure['remaining_long_budget'],
+                'remaining_short_budget': exposure['remaining_short_budget'],
                 'take_profit_pnl': self.take_profit_pnl,
                 'stop_loss_pnl': self.stop_loss_pnl,
                 'leverage': self.leverage,
                 'enable_grid_adaptation': self.enable_grid_adaptation,
                 'grid_adjustments_count': self.grid_adjustments_count,
-                'max_positions': self.max_positions,
-                'current_buy_positions': buy_count,
-                'current_sell_positions': sell_count,
                 'pnl': self.pnl,
                 'pnl_percentage': (self.pnl / self.initial_investment) * 100 if self.initial_investment else 0,
                 'trades_count': self.trades_count,
