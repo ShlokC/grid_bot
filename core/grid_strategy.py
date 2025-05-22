@@ -1,5 +1,5 @@
 """
-Grid trading strategy implementation.
+Grid trading strategy implementation with proper position management.
 """
 import logging
 import time
@@ -15,37 +15,22 @@ class GridStrategy:
                  price_upper: float,
                  grid_number: int,
                  investment: float,
-                 take_profit_pnl: float,  # Take profit PnL percentage
-                 stop_loss_pnl: float,    # Stop loss PnL percentage
+                 take_profit_pnl: float,
+                 stop_loss_pnl: float,
                  grid_id: str,
-                 leverage: float = 20.0,   # Default to 1x leverage
-                 enable_grid_adaptation: bool = True):  # Enable grid to follow price movements
+                 leverage: float = 20.0,
+                 enable_grid_adaptation: bool = True):
         """
-        Initialize the grid strategy.
-        
-        Args:
-            exchange: Exchange instance
-            symbol: Trading pair (e.g., 'BTC/USDT')
-            price_lower: Lower price boundary
-            price_upper: Upper price boundary
-            grid_number: Number of grid levels
-            investment: Total investment amount
-            take_profit_pnl: Take profit PnL percentage
-            stop_loss_pnl: Stop loss PnL percentage
-            grid_id: Unique identifier for this grid
-            leverage: Trading leverage (e.g., 1.0, 10.0, etc.)
-            enable_grid_adaptation: Whether to adapt grid when price moves outside boundaries
+        Initialize the grid strategy with position management.
         """
         self.logger = logging.getLogger(__name__)
         self.exchange = exchange
         
-        # Store original symbol for display and the ID for API calls
         self.original_symbol = symbol
         self.symbol = exchange._get_symbol_id(symbol) if hasattr(exchange, '_get_symbol_id') else symbol
         
         self.logger.debug(f"Initialized GridStrategy with symbol: {self.original_symbol}, ID: {self.symbol}")
         
-        # Convert all numeric inputs to proper types
         self.price_lower = float(price_lower)
         self.price_upper = float(price_upper)
         self.grid_number = int(grid_number)
@@ -58,18 +43,24 @@ class GridStrategy:
         
         # Calculate grid parameters
         self.grid_interval = (self.price_upper - self.price_lower) / self.grid_number
-        self.original_grid_interval = self.grid_interval  # Store original interval for reference
+        self.original_grid_interval = self.grid_interval
+        
+        # Position management
+        self.max_positions = max(1, self.grid_number // 2)  # Max positions in one direction
+        self.position_history = []       # Track filled orders for PnL calculation
+        self.buy_orders_filled = []      # Track filled buy orders
+        self.sell_orders_filled = []     # Track filled sell orders
         
         # Store grid orders and positions
-        self.grid_orders = {}  # order_id -> order_info
-        self.positions = {}    # position_id -> position_info
+        self.grid_orders = {}
+        self.positions = {}
         
         # Performance metrics
         self.pnl = 0.0
         self.initial_investment = investment
         self.trades_count = 0
         self.running = False
-        self.grid_adjustments_count = 0  # Track number of grid adjustments made
+        self.grid_adjustments_count = 0
         
         # Market information
         self._fetch_market_info()
@@ -91,35 +82,21 @@ class GridStrategy:
             self.min_cost = 0.0
         
     def _round_price(self, price: float) -> float:
-        """
-        Round price according to market precision using string formatting.
-        This avoids problems with the built-in round() function.
-        """
+        """Round price according to market precision."""
         try:
-            # Determine appropriate precision for the price
-            # Start with exchange-specified precision if available
             if hasattr(self, 'price_precision') and isinstance(self.price_precision, int):
-                # Use exchange-defined precision
                 decimals = self.price_precision
             else:
-                # Default to asset-appropriate precision if exchange info not available
                 if price < 0.1:
-                    # Very low-priced assets need more precision
                     decimals = 8
                 elif price < 10:
-                    # Low-priced assets need medium precision
                     decimals = 6
                 elif price < 1000:
-                    # Medium-priced assets need less precision
                     decimals = 4
                 else:
-                    # High-priced assets need minimal precision
                     decimals = 2
             
-            # Create format string with appropriate precision
             format_str = f"{{:.{decimals}f}}"
-            
-            # Format to string with specified precision then back to float
             formatted_price = format_str.format(price)
             precise_price = float(formatted_price)
             
@@ -127,39 +104,24 @@ class GridStrategy:
             return precise_price
         except Exception as e:
             self.logger.error(f"Error rounding price {price}: {e}")
-            # Fallback - return original value but ensure it's a float
             return float(price)
     
     def _round_amount(self, amount: float) -> float:
-        """
-        Round amount according to market precision using string formatting.
-        This avoids problems with the built-in round() function.
-        """
+        """Round amount according to market precision."""
         try:
-            # Determine appropriate precision for the amount
-            # Start with exchange-specified precision if available
             if hasattr(self, 'amount_precision') and isinstance(self.amount_precision, int):
-                # Use exchange-defined precision
                 decimals = self.amount_precision
             else:
-                # Default to asset-appropriate precision if exchange info not available
                 if amount < 0.001:
-                    # Very small amounts (like BTC) need more precision
                     decimals = 8
                 elif amount < 1:
-                    # Small amounts need medium precision
                     decimals = 6 
                 elif amount < 1000:
-                    # Medium amounts need less precision
                     decimals = 4
                 else:
-                    # Large amounts need minimal precision
                     decimals = 2
             
-            # Create format string with appropriate precision
             format_str = f"{{:.{decimals}f}}"
-            
-            # Format to string with specified precision then back to float
             formatted_amount = format_str.format(amount)
             precise_amount = float(formatted_amount)
             
@@ -167,61 +129,39 @@ class GridStrategy:
             return precise_amount
         except Exception as e:
             self.logger.error(f"Error rounding amount {amount}: {e}")
-            # Fallback - return original value but ensure it's a float
             return float(amount)
     
     def _calculate_grid_levels(self) -> List[float]:
         """Calculate grid price levels with proper precision."""
         try:
-            # Ensure we're working with the correct types
             price_lower = float(self.price_lower)
             price_upper = float(self.price_upper)
             grid_number = int(self.grid_number)
             
-            # Calculate grid interval
             grid_interval = (price_upper - price_lower) / grid_number
-            
-            # Generate levels with explicit string formatting for precise decimal control
             levels = []
             
-            # Determine appropriate string format based on the asset's typical pricing
-            # Use more decimal places for lower-priced assets
             if price_lower < 0.1:
-                # Use 8 decimals for very low-priced assets (like many altcoins)
                 format_str = "{:.8f}"
             elif price_lower < 10:
-                # Use 6 decimals for low-priced assets
                 format_str = "{:.6f}"
             elif price_lower < 1000:
-                # Use 4 decimals for medium-priced assets
                 format_str = "{:.4f}"
             else:
-                # Use 2 decimals for high-priced assets
                 format_str = "{:.2f}"
                 
-            # Log the format we're using
             self.logger.debug(f"Using price format: {format_str} for price range {price_lower}-{price_upper}")
             
             for i in range(grid_number + 1):
-                # Calculate exact level
                 exact_level = price_lower + (i * grid_interval)
-                
-                # Format to string with appropriate precision then back to float
-                # This ensures we have exact decimal representation
                 formatted_level = format_str.format(exact_level)
                 precise_level = float(formatted_level)
-                
                 levels.append(precise_level)
                 self.logger.debug(f"Grid level {i}: {exact_level} → {precise_level}")
                 
-            # Verify we have the correct number of levels
-            if len(levels) != grid_number + 1:
-                self.logger.warning(f"Expected {grid_number + 1} grid levels, but got {len(levels)}")
-                
-            # Force correct endpoints to ensure grid boundaries match exactly
             if levels and len(levels) > 1:
-                levels[0] = price_lower  # First level is always exactly price_lower
-                levels[-1] = price_upper  # Last level is always exactly price_upper
+                levels[0] = price_lower
+                levels[-1] = price_upper
                 
             return levels
         except Exception as e:
@@ -232,29 +172,23 @@ class GridStrategy:
     def _calculate_order_amount(self) -> float:
         """Calculate order amount for each grid level."""
         try:
-            # Ensure we have the correct types
             investment = float(self.investment)
             grid_number = int(self.grid_number)
             leverage = float(self.leverage) if hasattr(self, 'leverage') else 20.0
             
-            # Simple distribution: equal investment per grid level
             investment_per_grid = investment / grid_number
             self.logger.info(f"Investment per grid: {investment_per_grid}")
             
-            # Get current price to estimate amount
             ticker = self.exchange.get_ticker(self.symbol)
             price = float(ticker['last'])
             self.logger.info(f"Current price for {self.symbol}: {price}")
             
-            # Calculate base amount with leverage
             amount = (investment_per_grid * leverage) / price
             self.logger.info(f"Base order amount (with {leverage}x leverage): {amount}")
             
-            # Ensure amount meets minimum requirements
             min_amount = self.min_amount if hasattr(self, 'min_amount') and self.min_amount > 0 else 0.00001
             amount = max(amount, min_amount)
             
-            # Round amount according to market precision
             rounded_amount = self._round_amount(amount)
             self.logger.info(f"Final rounded order amount: {rounded_amount}")
             
@@ -265,21 +199,15 @@ class GridStrategy:
             return self.min_amount if hasattr(self, 'min_amount') and self.min_amount > 0 else 0.00001
     
     def _cancel_existing_orders(self):
-        """Cancel any existing orders for this symbol to avoid duplicates."""
+        """Cancel any existing orders for this symbol."""
         try:
-            # Get existing open orders
             open_orders = self.exchange.get_open_orders(self.symbol)
             
             if open_orders:
                 self.logger.info(f"Found {len(open_orders)} existing open orders for {self.symbol}. Cancelling...")
-                
-                # Cancel all orders
                 self.exchange.cancel_all_orders(self.symbol)
-                
-                # Wait for cancellation to complete
                 time.sleep(2)
                 
-                # Verify cancellation
                 open_orders_after = self.exchange.get_open_orders(self.symbol)
                 if open_orders_after:
                     self.logger.warning(f"Some orders ({len(open_orders_after)}) still remain after cancellation attempt.")
@@ -288,50 +216,68 @@ class GridStrategy:
                     
         except Exception as e:
             self.logger.error(f"Error cancelling existing orders: {str(e)}")
-            # Don't re-raise, we'll still try to set up new orders
     
-    def setup_grid(self) -> None:
-        """Setup the initial grid orders with confirmation checks."""
+    def _get_current_position_counts(self) -> tuple:
+        """Get current position counts by counting actual open orders."""
         try:
-            # Make sure we're using the correct types
+            open_orders = self.exchange.get_open_orders(self.symbol)
+            buy_count = len([order for order in open_orders if order['side'] == 'buy'])
+            sell_count = len([order for order in open_orders if order['side'] == 'sell'])
+            return buy_count, sell_count
+        except Exception as e:
+            self.logger.error(f"Error getting current position counts: {e}")
+            return 0, 0
+    
+    def _can_place_buy_order(self) -> bool:
+        """Check if we can place a buy order without exceeding position limits."""
+        buy_count, _ = self._get_current_position_counts()
+        return buy_count < self.max_positions
+    
+    def _can_place_sell_order(self) -> bool:
+        """Check if we can place a sell order without exceeding position limits."""
+        _, sell_count = self._get_current_position_counts()
+        return sell_count < self.max_positions
+    
+    def _update_position_count(self, order_type: str, action: str):
+        """Legacy function - position counts now based on actual open orders."""
+        pass
+
+    def setup_grid(self) -> None:
+        """Setup the initial grid orders with position management."""
+        try:
             self.price_lower = float(self.price_lower)
             self.price_upper = float(self.price_upper)
             self.grid_number = int(self.grid_number)
             self.investment = float(self.investment)
             
-            # Calculate grid levels
             grid_levels = self._calculate_grid_levels()
-            
-            # Debug log the grid levels to verify they're calculated correctly
-            self.logger.info(f"Grid levels: {grid_levels}")
-            
-            # Calculate order amount
             amount = self._calculate_order_amount()
-            self.logger.info(f"Order amount per grid: {amount}")
-            
-            # Get current price
             current_price = float(self.exchange.get_ticker(self.symbol)['last'])
+            
+            # Get current position counts for logging
+            buy_count, sell_count = self._get_current_position_counts()
+            
             self.logger.info(f"Setting up grid for {self.symbol} with {self.grid_number} levels")
             self.logger.info(f"Price range: {self.price_lower} - {self.price_upper}")
             self.logger.info(f"Current price: {current_price}")
-            self.logger.info(f"Leverage: {self.leverage}x")
+            self.logger.info(f"Max positions per direction: {self.max_positions}")
+            self.logger.info(f"Current open orders: Buy={buy_count}, Sell={sell_count}")
             
-            # Check for existing orders and cancel if needed
             self._cancel_existing_orders()
-            
-            # Clear existing orders tracking
             self.grid_orders = {}
             
-            # Loop through grid levels and place orders with confirmation
+            grid_levels = self._calculate_grid_levels()
+            amount = self._calculate_order_amount()
+            
             order_count = 0
-            retry_count = 3  # Maximum retries for order placement
+            retry_count = 3
             
             for i in range(len(grid_levels) - 1):
                 buy_price = grid_levels[i]
                 sell_price = grid_levels[i + 1]
                 
-                # Only place buy orders below current price
-                if buy_price < current_price:
+                # Place buy orders below current price (with position limit check)
+                if buy_price < current_price and self._can_place_buy_order():
                     order_placed = False
                     retry = 0
                     
@@ -342,10 +288,7 @@ class GridStrategy:
                                 self.symbol, 'buy', amount, buy_price
                             )
                             
-                            # Wait briefly for the order to be processed by the exchange
                             time.sleep(1)
-                            
-                            # Verify the order was created
                             order_status = self.exchange.get_order_status(order['id'], self.symbol)
                             
                             if order_status and order_status['status'] in ['open', 'new', 'partially_filled']:
@@ -365,15 +308,18 @@ class GridStrategy:
                         except Exception as e:
                             self.logger.error(f"Failed to place buy order at level {i} price {buy_price}: {str(e)}")
                             retry += 1
-                            time.sleep(2)  # Wait before retrying
+                            time.sleep(2)
                     
                     if not order_placed:
                         self.logger.error(f"Failed to place buy order at level {i} after {retry_count} attempts")
+                elif buy_price < current_price:
+                    buy_count, _ = self._get_current_position_counts()
+                    self.logger.info(f"Skipping buy order at price {buy_price} (position limit reached: {buy_count}/{self.max_positions})")
                 else:
                     self.logger.info(f"Skipping buy order at price {buy_price} (above current price)")
                     
-                # Only place sell orders above current price
-                if sell_price > current_price:
+                # Place sell orders above current price (with position limit check)
+                if sell_price > current_price and self._can_place_sell_order():
                     order_placed = False
                     retry = 0
                     
@@ -384,10 +330,7 @@ class GridStrategy:
                                 self.symbol, 'sell', amount, sell_price
                             )
                             
-                            # Wait briefly for the order to be processed by the exchange
                             time.sleep(1)
-                            
-                            # Verify the order was created
                             order_status = self.exchange.get_order_status(order['id'], self.symbol)
                             
                             if order_status and order_status['status'] in ['open', 'new', 'partially_filled']:
@@ -407,18 +350,19 @@ class GridStrategy:
                         except Exception as e:
                             self.logger.error(f"Failed to place sell order at level {i+1} price {sell_price}: {str(e)}")
                             retry += 1
-                            time.sleep(2)  # Wait before retrying
+                            time.sleep(2)
                     
                     if not order_placed:
                         self.logger.error(f"Failed to place sell order at level {i+1} after {retry_count} attempts")
+                elif sell_price > current_price:
+                    _, sell_count = self._get_current_position_counts()
+                    self.logger.info(f"Skipping sell order at price {sell_price} (position limit reached: {sell_count}/{self.max_positions})")
                 else:
                     self.logger.info(f"Skipping sell order at price {sell_price} (below current price)")
             
-            # Log the number of orders placed
             open_orders = [o for o in self.grid_orders.values() if o['status'] == 'open']
             self.logger.info(f"Grid setup complete. Successfully placed {len(open_orders)} orders.")
             
-            # Only mark the grid as running if we successfully placed at least one order
             if len(open_orders) > 0:
                 self.running = True
                 self.logger.info(f"Grid is now running with {len(open_orders)} active orders.")
@@ -430,25 +374,20 @@ class GridStrategy:
             self.logger.error(f"Error setting up grid: {str(e)}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
             self.running = False
-    
+
     def update_grid(self) -> None:
         """Update grid orders and check for grid adaptation if needed."""
         try:
             if not self.running:
                 return
             
-            # Get current price
             current_price = float(self.exchange.get_ticker(self.symbol)['last'])
             
-            # Check if price is outside grid boundaries and adaptation is enabled
             if self.enable_grid_adaptation and self._is_price_outside_grid(current_price):
                 self._adapt_grid_to_price(current_price)
-                return  # Skip regular update since we've reset the grid
+                return
             
-            # Regular grid update logic
             self._update_orders()
-            
-            # Check for take profit or stop loss
             self._check_tp_sl()
         except Exception as e:
             self.logger.error(f"Error updating grid: {e}")
@@ -456,7 +395,6 @@ class GridStrategy:
 
     def _is_price_outside_grid(self, current_price: float) -> bool:
         """Check if price is outside the grid boundaries."""
-        # Add a small buffer (0.5% of grid range) to avoid triggering adaptation too frequently
         buffer_size = (self.price_upper - self.price_lower) * 0.005
         
         if current_price < (self.price_lower - buffer_size) or current_price > (self.price_upper + buffer_size):
@@ -465,70 +403,52 @@ class GridStrategy:
         return False
     
     def _adapt_grid_to_price(self, current_price: float) -> None:
-        """
-        Adapt the grid to follow the price movement.
-        
-        This method will:
-        1. Calculate new grid boundaries centered around current price
-        2. Cancel all existing orders
-        3. Set up a new grid with the new boundaries
-        """
+        """Adapt the grid to follow the price movement."""
         try:
             self.logger.info(f"Adapting grid to follow price movement. Current price: {current_price}")
             
-            # Store old boundaries for logging
             old_lower = self.price_lower
             old_upper = self.price_upper
             
-            # Calculate grid size and boundaries
             grid_size = self.price_upper - self.price_lower
             grid_center = current_price
             
-            # Calculate new boundaries ensuring we maintain the same grid size
             new_lower = grid_center - (grid_size / 2)
             new_upper = grid_center + (grid_size / 2)
             
-            # Ensure new boundaries are valid (positive prices)
             if new_lower <= 0:
-                new_lower = 0.00001  # Set to small positive value
+                new_lower = 0.00001
                 new_upper = new_lower + grid_size
             
             self.logger.info(f"New grid boundaries: [{new_lower} - {new_upper}] (old: [{old_lower} - {old_upper}])")
             
-            # Update grid parameters
             self.price_lower = new_lower
             self.price_upper = new_upper
             self.grid_interval = (self.price_upper - self.price_lower) / self.grid_number
             
-            # Cancel all existing orders
+            # Reset position tracking for new grid (no counters to reset)
+            pass
+            
             self.logger.info("Cancelling all existing orders before adapting grid")
             try:
                 self.exchange.cancel_all_orders(self.symbol)
-                # Wait for cancellation to complete
                 time.sleep(2)
             except Exception as cancel_error:
                 self.logger.error(f"Error cancelling orders during grid adaptation: {cancel_error}")
             
-            # Set up new grid with updated boundaries
             self.logger.info("Setting up new grid with adapted boundaries")
             
-            # Reset grid orders tracking
             old_grid_orders = self.grid_orders.copy()
             self.grid_orders = {}
             
-            # Try to setup the new grid
             try:
                 self.setup_grid()
-                
-                # Increment adjustment counter
                 self.grid_adjustments_count += 1
                 self.logger.info(f"Successfully adapted grid to new boundaries. Adjustment #{self.grid_adjustments_count}")
                 
             except Exception as setup_error:
-                # If setting up new grid fails, log error and try to restore old grid
                 self.logger.error(f"Failed to set up adapted grid: {setup_error}")
                 
-                # Restore old grid parameters
                 self.price_lower = old_lower
                 self.price_upper = old_upper
                 self.grid_interval = (self.price_upper - self.price_lower) / self.grid_number
@@ -541,75 +461,74 @@ class GridStrategy:
             self.logger.error(f"Traceback: {traceback.format_exc()}")
     
     def _update_orders(self):
-        """Update order status and handle filled orders."""
-        # Check open orders
+        """Update order status and handle filled orders with position tracking."""
         open_orders = self.exchange.get_open_orders(self.symbol)
-        
-        # Create a map of order IDs for quick lookup
         current_order_ids = {order['id']: order for order in open_orders}
         
-        # Track which grid levels already have active orders to avoid duplicates
         active_buy_levels = set()
         active_sell_levels = set()
         
-        # Update status of all tracked orders
         for order_id in list(self.grid_orders.keys()):
             order_info = self.grid_orders[order_id]
             grid_level = order_info['grid_level']
             
-            # If order is in current open orders, it's still active
             if order_id in current_order_ids:
-                # Update status if needed
                 if order_info['status'] != 'open':
                     order_info['status'] = 'open'
                 
-                # Track active grid levels
                 if order_info['type'] == 'buy':
                     active_buy_levels.add(grid_level)
                 else:
                     active_sell_levels.add(grid_level)
             
-            # If order was open but not in current open orders, it may be filled
             elif order_info['status'] == 'open':
                 try:
-                    # Check order status
                     order_status = self.exchange.get_order_status(order_id, self.symbol)
                     
-                    if order_status['status'] == 'filled':
-                        # Order was filled
-                        order_info['status'] = 'filled'
+                    if order_status['status'] in ['filled', 'closed']:
+                        order_info['status'] = order_status['status']
                         self.trades_count += 1
                         
-                        # Calculate profit/loss for this trade
-                        if order_info['type'] == 'sell':
-                            # Simple profit calculation
-                            fill_price = float(order_status.get('average', order_info['price']))
-                            profit = order_info['amount'] * (fill_price - self.price_lower)
-                            self.pnl += profit
-                            self.logger.info(f"Order filled: {order_id} ({order_info['type']} at {fill_price}). Profit: {profit:.2f}")
-                        else:
-                            self.logger.info(f"Order filled: {order_id} ({order_info['type']} at {order_info['price']})")
+                        # Update position count (legacy call - now does nothing)
+                        self._update_position_count(order_info['type'], "add")
                         
-                        # Place counter order with confirmation
+                        # Track filled orders for proper PnL calculation
+                        fill_price = float(order_status.get('average', order_info['price']))
+                        fill_data = {
+                            'type': order_info['type'],
+                            'price': fill_price,
+                            'amount': order_info['amount'],
+                            'timestamp': time.time(),
+                            'grid_level': order_info['grid_level']
+                        }
+                        
+                        if order_info['type'] == 'buy':
+                            self.buy_orders_filled.append(fill_data)
+                            self.logger.info(f"Buy order filled: {order_id} at {fill_price}")
+                        else:
+                            self.sell_orders_filled.append(fill_data)
+                            self.logger.info(f"Sell order filled: {order_id} at {fill_price}")
+                        
+                        # Calculate PnL from completed round trips
+                        self._calculate_pnl()
+                        
+                        # Place counter order with position limit check
                         self._place_counter_order_with_confirmation(order_info)
                     
                     elif order_status['status'] == 'canceled':
-                        # Order was cancelled
                         order_info['status'] = 'cancelled'
                         self.logger.info(f"Order cancelled: {order_id}")
                     
                     else:
-                        # Unexpected status
                         self.logger.warning(f"Unexpected order status for {order_id}: {order_status['status']}")
                         
                 except Exception as e:
                     self.logger.error(f"Error checking order {order_id} status: {e}")
         
-        # Check for missing grid orders (in case some were lost or not created)
         self._ensure_grid_coverage(active_buy_levels, active_sell_levels)
     
     def _place_counter_order_with_confirmation(self, filled_order: Dict) -> None:
-        """Place a counter order after an order is filled, with confirmation."""
+        """Place a counter order after an order is filled, with position limit check."""
         try:
             grid_level = filled_order['grid_level']
             price = filled_order['price']
@@ -617,10 +536,10 @@ class GridStrategy:
             retry_count = 3
             
             if filled_order['type'] == 'buy':
-                # If buy order filled, place sell order one level up
+                # Place sell order one level up (if we can)
                 sell_price = self._round_price(price + self.grid_interval)
                 
-                if sell_price <= self.price_upper:
+                if sell_price <= self.price_upper and self._can_place_sell_order():
                     order_placed = False
                     retry = 0
                     
@@ -631,10 +550,7 @@ class GridStrategy:
                                 self.symbol, 'sell', amount, sell_price
                             )
                             
-                            # Wait briefly for the order to be processed
                             time.sleep(1)
-                            
-                            # Verify the order was created
                             order_status = self.exchange.get_order_status(order['id'], self.symbol)
                             
                             if order_status and order_status['status'] in ['open', 'new', 'partially_filled']:
@@ -653,16 +569,22 @@ class GridStrategy:
                         except Exception as e:
                             self.logger.error(f"Failed to place counter sell order at {sell_price}: {e}")
                             retry += 1
-                            time.sleep(2)  # Wait before retrying
+                            time.sleep(2)
                     
                     if not order_placed:
                         self.logger.error(f"Failed to place counter sell order after {retry_count} attempts")
+                else:
+                    if sell_price > self.price_upper:
+                        self.logger.info(f"Counter sell order at {sell_price} exceeds upper price limit")
+                    else:
+                        _, sell_count = self._get_current_position_counts()
+                        self.logger.info(f"Cannot place counter sell order - position limit reached ({sell_count}/{self.max_positions})")
             
             elif filled_order['type'] == 'sell':
-                # If sell order filled, place buy order one level down
+                # Place buy order one level down (if we can)
                 buy_price = self._round_price(price - self.grid_interval)
                 
-                if buy_price >= self.price_lower:
+                if buy_price >= self.price_lower and self._can_place_buy_order():
                     order_placed = False
                     retry = 0
                     
@@ -673,10 +595,7 @@ class GridStrategy:
                                 self.symbol, 'buy', amount, buy_price
                             )
                             
-                            # Wait briefly for the order to be processed
                             time.sleep(1)
-                            
-                            # Verify the order was created
                             order_status = self.exchange.get_order_status(order['id'], self.symbol)
                             
                             if order_status and order_status['status'] in ['open', 'new', 'partially_filled']:
@@ -695,38 +614,77 @@ class GridStrategy:
                         except Exception as e:
                             self.logger.error(f"Failed to place counter buy order at {buy_price}: {e}")
                             retry += 1
-                            time.sleep(2)  # Wait before retrying
+                            time.sleep(2)
                     
                     if not order_placed:
                         self.logger.error(f"Failed to place counter buy order after {retry_count} attempts")
+                else:
+                    if buy_price < self.price_lower:
+                        self.logger.info(f"Counter buy order at {buy_price} below lower price limit")
+                    else:
+                        buy_count, _ = self._get_current_position_counts()
+                        self.logger.info(f"Cannot place counter buy order - position limit reached ({buy_count}/{self.max_positions})")
         
         except Exception as e:
             self.logger.error(f"Error in _place_counter_order_with_confirmation: {e}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
     
-    def _ensure_grid_coverage(self, active_buy_levels: Set[int], active_sell_levels: Set[int]) -> None:
-        """Ensure all grid levels have active orders if needed."""
+    def _calculate_pnl(self) -> None:
+        """Calculate PnL from completed round trips (buy-sell pairs)."""
         try:
-            # Current price is needed to determine which levels should have orders
+            total_pnl = 0.0
+            
+            # Sort orders by timestamp to match buy-sell pairs
+            buy_orders = sorted(self.buy_orders_filled, key=lambda x: x['timestamp'])
+            sell_orders = sorted(self.sell_orders_filled, key=lambda x: x['timestamp'])
+            
+            # Match completed round trips
+            matched_pairs = min(len(buy_orders), len(sell_orders))
+            
+            for i in range(matched_pairs):
+                buy_order = buy_orders[i]
+                sell_order = sell_orders[i]
+                
+                # Calculate profit for this round trip
+                # Profit = (sell_price - buy_price) * amount
+                profit = (sell_order['price'] - buy_order['price']) * buy_order['amount']
+                total_pnl += profit
+                
+                self.logger.debug(f"Round trip {i+1}: Buy at {buy_order['price']}, Sell at {sell_order['price']}, Profit: {profit:.6f}")
+            
+            self.pnl = total_pnl
+            pnl_percentage = (self.pnl / self.initial_investment) * 100 if self.initial_investment > 0 else 0
+            
+            self.logger.debug(f"Total PnL: {self.pnl:.6f} ({pnl_percentage:.4f}%)")
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating PnL: {e}")
+    
+        """Ensure all grid levels have active orders if needed, with position limits."""
+        try:
             current_price = float(self.exchange.get_ticker(self.symbol)['last'])
             grid_levels = self._calculate_grid_levels()
             amount = self._calculate_order_amount()
             
-            # Only check for missing orders if we have grid levels
             if not grid_levels or len(grid_levels) <= 1:
                 return
                 
             self.logger.debug(f"Checking grid coverage. Current price: {current_price}")
-            self.logger.debug(f"Active buy levels: {active_buy_levels}")
-            self.logger.debug(f"Active sell levels: {active_sell_levels}")
+            self.logger.debug(f"Active buy levels: {self.active_buy_levels}")
+            self.logger.debug(f"Active sell levels: {self.active_sell_levels}")
             
-            # Check each grid level
+            buy_count, sell_count = self._get_current_position_counts()
+            self.logger.debug(f"Position limits: Buy={buy_count}/{self.max_positions}, Sell={sell_count}/{self.max_positions}")
+            
             for i in range(len(grid_levels) - 1):
                 buy_price = grid_levels[i]
                 sell_price = grid_levels[i + 1]
                 
-                # Check for missing buy orders below current price
-                if buy_price < current_price and i not in active_buy_levels:
+                # Check for missing buy orders below current price (with position limit)
+                if (buy_price < current_price and 
+                    i not in self.active_buy_levels and 
+                    self._can_place_buy_order()):
+                    
                     self.logger.info(f"Missing buy order at level {i} (price: {buy_price}). Placing order...")
                     try:
                         order = self.exchange.create_limit_order(self.symbol, 'buy', amount, buy_price)
@@ -741,8 +699,11 @@ class GridStrategy:
                     except Exception as e:
                         self.logger.error(f"Failed to place missing buy order at level {i}: {e}")
                 
-                # Check for missing sell orders above current price
-                if sell_price > current_price and (i + 1) not in active_sell_levels:
+                # Check for missing sell orders above current price (with position limit)
+                if (sell_price > current_price and 
+                    (i + 1) not in self.active_sell_levels and 
+                    self._can_place_sell_order()):
+                    
                     self.logger.info(f"Missing sell order at level {i+1} (price: {sell_price}). Placing order...")
                     try:
                         order = self.exchange.create_limit_order(self.symbol, 'sell', amount, sell_price)
@@ -764,7 +725,6 @@ class GridStrategy:
     def _check_tp_sl(self) -> None:
         """Check if take profit or stop loss conditions are met."""
         try:
-            # Calculate PnL percentage
             pnl_percentage = (self.pnl / self.initial_investment) * 100
             if pnl_percentage >= self.take_profit_pnl:
                 self.logger.info(f"Take profit reached: {pnl_percentage:.2f}% >= {self.take_profit_pnl:.2f}%")
@@ -787,12 +747,10 @@ class GridStrategy:
                 
             self.logger.info(f"Stopping grid strategy for {self.symbol}")
             
-            # Cancel all open orders
             try:
                 self.exchange.cancel_all_orders(self.symbol)
                 self.logger.info(f"All orders cancelled for {self.symbol}")
                 
-                # Mark all orders as cancelled in our local tracking
                 for order_id in self.grid_orders:
                     if self.grid_orders[order_id]['status'] == 'open':
                         self.grid_orders[order_id]['status'] = 'cancelled'
@@ -800,7 +758,6 @@ class GridStrategy:
             except Exception as e:
                 self.logger.error(f"Error cancelling orders for {self.symbol}: {e}")
             
-            # Close all positions with enhanced error handling
             try:
                 positions = self.exchange.get_positions(self.symbol)
                 for position in positions:
@@ -819,18 +776,21 @@ class GridStrategy:
             except Exception as e:
                 self.logger.error(f"Error getting positions for {self.symbol}: {e}")
 
+            # Reset position counters (no longer used)
+            pass
+            
             self.running = False
             self.logger.info(f"Grid strategy stopped for {self.symbol}")
             
         except Exception as e:
             self.logger.error(f"Error stopping grid: {e}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
-            # Ensure grid is marked as stopped even if there are errors
             self.running = False
         
     def get_status(self) -> Dict:
-        """Get the current status of the grid strategy with adaptation info."""
+        """Get the current status of the grid strategy with position info."""
         try:
+            buy_count, sell_count = self._get_current_position_counts()
             status = {
                 'grid_id': self.grid_id,
                 'symbol': self.symbol,
@@ -845,6 +805,9 @@ class GridStrategy:
                 'leverage': self.leverage,
                 'enable_grid_adaptation': self.enable_grid_adaptation,
                 'grid_adjustments_count': self.grid_adjustments_count,
+                'max_positions': self.max_positions,
+                'current_buy_positions': buy_count,
+                'current_sell_positions': sell_count,
                 'pnl': self.pnl,
                 'pnl_percentage': (self.pnl / self.initial_investment) * 100 if self.initial_investment else 0,
                 'trades_count': self.trades_count,
