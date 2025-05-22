@@ -146,6 +146,7 @@ def create_grid():
             logger.info(f"Price range: {price_lower} - {price_upper}")
             logger.info(f"Investment: {investment}, Leverage: {leverage}x")
             logger.info(f"Grid adaptation: {'enabled' if enable_grid_adaptation else 'disabled'}")
+            logger.info(f"SAMIG: {'enabled' if enable_samig else 'disabled'}")
             
             # Create grid
             grid_id = grid_manager.create_grid(
@@ -234,7 +235,9 @@ def edit_grid(grid_id):
             stop_loss_pnl = float(request.form['stop_loss_pnl'])
             enable_grid_adaptation = 'enable_grid_adaptation' in request.form
             enable_samig = 'enable_samig' in request.form
-            logger.info(f"Updating grid {grid_id}: TP={take_profit_pnl}%, SL={stop_loss_pnl}%, Adaptation={enable_grid_adaptation}")
+            
+            logger.info(f"Updating grid {grid_id}: TP={take_profit_pnl}%, SL={stop_loss_pnl}%, "
+                       f"Adaptation={enable_grid_adaptation}, SAMIG={enable_samig}")
             
             if grid_manager.update_grid_config(
                 grid_id=grid_id,

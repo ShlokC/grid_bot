@@ -33,6 +33,7 @@
                 <th>Investment</th>
                 <th>PnL</th>
                 <th>Status</th>
+                <th>Type</th>
                 <th>Actions</th>
             </tr>
         </thead>
@@ -46,6 +47,13 @@
                 <td>{{ "%.2f"|format(grid.investment) }}</td>
                 <td>{{ "%.2f"|format(grid.pnl) }} ({{ "%.2f"|format(grid.pnl_percentage) }}%)</td>
                 <td>{{ "Running" if grid.running else "Stopped" }}</td>
+                <td>
+                    {% if grid.samig_active %}
+                        <span style="color: #4CAF50; font-weight: bold;">SAMIG</span>
+                    {% else %}
+                        <span style="color: #666;">Standard</span>
+                    {% endif %}
+                </td>
                 <td class="action-cell">
                     {% if grid.running %}
                     <a href="/grid/stop/{{ grid.grid_id }}" class="button red">Stop</a>
